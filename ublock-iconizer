@@ -4,250 +4,582 @@
 # ublock-iconizer: make the uBlock Origin Lite toolbar icon in Safari a grey
 # template icon (like Apple's own), and restore the pristine App Store build.
 #
-#   ublock-iconizer status
-#   ublock-iconizer patch   [--identity NAME] [--app PATH]
-#   ublock-iconizer restore [--app PATH]
+#   ublock-iconizer status  [--app PATH]
+#   ublock-iconizer patch   [--app PATH] [--identity NAME] [--style grey|template]
+#   ublock-iconizer restore [--app PATH] [--delete-backup]
 #
 # Patching keeps a pristine copy of the app under ~/Library/Application Support
 # so `restore` can put it back without a reinstall from the App Store.
 
+require 'fileutils'
 require 'json'
 require 'open3'
 require 'optparse'
-require 'fileutils'
-require 'tmpdir'
 require 'time'
+require 'tmpdir'
 
 module UblockIconizer
-  DEFAULT_APP = '/Applications/uBlock Origin Lite.app'
-  EXT_RELATIVE = 'Contents/PlugIns/uBlock Origin Lite Extension.appex'
-  ICON_SIZES = [16, 32, 64, 128].freeze
+  DEFAULT_APP_PATH = '/Applications/uBlock Origin Lite.app'
+  DEFAULT_SUPPORT_DIR = '~/Library/Application Support/ublock-iconizer'
+  SUPPORT_DIR = File.expand_path(ENV.fetch('UBLOCK_ICONIZER_HOME', DEFAULT_SUPPORT_DIR))
+
+  class Error < StandardError; end
+
+  # Runs external commands and turns a failing exit into an Error.
+  module Shell
+    module_function
+
+    def run(*command, stdin: nil)
+      Open3.capture3(*command, stdin_data: stdin)
+    end
+
+    def run!(*command, stdin: nil)
+      stdout, stderr, status = run(*command, stdin: stdin)
+      return stdout if status.success?
+
+      detail = stderr.strip.empty? ? stdout.strip : stderr.strip
+      raise Error, "#{command.first} failed: #{detail}"
+    end
+
+    def succeeds?(*command)
+      _, _, status = run(*command)
+      status.success?
+    end
+
+    def which(name)
+      stdout, _, status = run('which', name)
+      status.success? ? stdout.strip : nil
+    end
+  end
+
+  # Colours for one icon state. With a `detail` colour the white bar and border
+  # are recoloured too; without one the icon becomes a black template.
+  Paint = Struct.new(:body, :detail, keyword_init: true)
+
+  # `on` paints the active icons, `off` the "no filtering" ones. A nil `off`
+  # leaves the "no filtering" icons as shipped.
+  Style = Struct.new(:name, :on, :off, keyword_init: true)
+
   # Safari tints a toolbar icon with the accent colour whenever the extension
   # has access to the tab, if the icon is single-coloured or every pixel is
   # near-grey (measured: a 24-unit channel spread still counts as grey, 45
   # does not). The grey style keeps a neutral body and puts the chroma in the
   # bar and border as a very pale blue, so Safari shows it as-is.
   STYLES = {
-    'grey' => { on: { body: '#828282', detail: '#C8D8F5' }, off: { body: '#B4B4B4', detail: '#C8D8F5' } },
-    'template' => { on: { body: 'black' }, off: nil }
+    'grey' => Style.new(
+      name: 'grey',
+      on: Paint.new(body: '#828282', detail: '#C8D8F5'),
+      off: Paint.new(body: '#B4B4B4', detail: '#C8D8F5')
+    ),
+    'template' => Style.new(
+      name: 'template',
+      on: Paint.new(body: 'black'),
+      off: nil
+    )
   }.freeze
-  APP_STORE_AUTHORITY = 'Apple Mac OS Application Signing'
-  SUPPORT_DIR = File.expand_path(ENV.fetch('UBLOCK_ICONIZER_HOME', '~/Library/Application Support/ublock-iconizer'))
-  LSREGISTER = '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
-  # Entitlements that only validate with the original team's provisioning,
-  # which a re-signed build cannot carry.
-  TEAM_BOUND_ENTITLEMENTS = %w[
-    com.apple.application-identifier
-    com.apple.developer.team-identifier
-    keychain-access-groups
-    com.apple.security.application-groups
-  ].freeze
 
-  class Error < StandardError; end
+  # The installed app bundle and the Safari extension inside it.
+  class AppBundle
+    EXTENSION_RELATIVE_PATH = 'Contents/PlugIns/uBlock Origin Lite Extension.appex'
+    APP_STORE_AUTHORITY = 'Apple Mac OS Application Signing'
+    ICON_SIZES = [16, 32, 64, 128].freeze
+    LSREGISTER = '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
 
-  module Shell
-    module_function
-
-    def run(*cmd, stdin: nil)
-      out, err, status = Open3.capture3(*cmd, stdin_data: stdin)
-      [out, err, status]
-    end
-
-    def run!(*cmd, stdin: nil)
-      out, err, status = run(*cmd, stdin: stdin)
-      raise Error, "#{cmd.first} failed: #{err.strip.empty? ? out.strip : err.strip}" unless status.success?
-
-      out
-    end
-
-    def which(name)
-      out, _, status = run('which', name)
-      status.success? ? out.strip : nil
-    end
-  end
-
-  class App
     attr_reader :path
 
     def initialize(path)
       @path = path
     end
 
-    def name = File.basename(path)
-    def ext_path = File.join(path, EXT_RELATIVE)
-    def img_dir = File.join(ext_path, 'Contents/Resources/img')
-    def info_plist = File.join(path, 'Contents/Info.plist')
-    def exist? = File.directory?(path) && File.directory?(ext_path)
+    def name
+      File.basename(path)
+    end
+
+    def extension_path
+      File.join(path, EXTENSION_RELATIVE_PATH)
+    end
+
+    def image_dir
+      File.join(extension_path, 'Contents/Resources/img')
+    end
+
+    def exist?
+      File.directory?(path) && File.directory?(extension_path)
+    end
 
     def version
+      info_plist = File.join(path, 'Contents/Info.plist')
       Shell.run!('plutil', '-extract', 'CFBundleShortVersionString', 'raw', info_plist).strip
     end
 
-    def on_icons = ICON_SIZES.map { |n| File.join(img_dir, "icon_#{n}.png") }
-    def off_icons = ICON_SIZES.map { |n| File.join(img_dir, "icon_#{n}_off.png") }
-
-    def signing_authority
-      _, err, = Shell.run('codesign', '-dv', '--verbose=2', path)
-      err[/^Authority=(.*)$/, 1]
+    def on_icons
+      ICON_SIZES.map { |size| File.join(image_dir, "icon_#{size}.png") }
     end
 
-    def app_store_signed? = signing_authority == APP_STORE_AUTHORITY
+    def off_icons
+      ICON_SIZES.map { |size| File.join(image_dir, "icon_#{size}_off.png") }
+    end
+
+    def signing_authority
+      _, stderr, = Shell.run('codesign', '-dv', '--verbose=2', path)
+      stderr[/^Authority=(.*)$/, 1]
+    end
+
+    def app_store_signed?
+      signing_authority == APP_STORE_AUTHORITY
+    end
 
     def signature_valid?
-      _, _, status = Shell.run('codesign', '--verify', '--deep', '--strict', path)
-      status.success?
+      CodeSigner.verifies?(path)
     end
 
     # Untouched App Store build: Apple-signed and the seal still verifies.
-    def pristine? = app_store_signed? && signature_valid?
+    def pristine?
+      app_store_signed? && signature_valid?
+    end
 
-    def icons_grey?
-      on_icons.all? { |png| Icons.grey?(png) }
+    def verify_signature!
+      Shell.run!('codesign', '--verify', '--deep', '--strict', path)
     end
 
     def entitlements(target = path)
       xml = Shell.run!('codesign', '-d', '--entitlements', '-', '--xml', target)
       return {} if xml.strip.empty?
 
-      JSON.parse(Shell.run!('plutil', '-convert', 'json', '-o', '-', '-', stdin: xml))
+      json = Shell.run!('plutil', '-convert', 'json', '-o', '-', '-', stdin: xml)
+      JSON.parse(json)
     end
 
-    def verify!
-      Shell.run!('codesign', '--verify', '--deep', '--strict', path)
+    def writable?
+      File.writable?(image_dir) && File.writable?(File.dirname(path))
+    end
+
+    # Tell LaunchServices and pluginkit about the re-signed bundle so Safari
+    # picks up the new one.
+    def register
+      Shell.run(LSREGISTER, '-f', path)
+      Shell.run('pluginkit', '-a', extension_path)
     end
   end
 
-  module Icons
-    module_function
+  # Inspects and recolours toolbar PNGs with ImageMagick 7.
+  class IconPainter
+    MISSING_MAGICK_ERROR = 'ImageMagick not found. Install it with: brew install imagemagick'
+    # Mean HSL saturation below this counts as grey. The stock maroon icon
+    # scores ~0.6; both patched styles stay well under 0.1.
+    GREY_SATURATION_LIMIT = 0.15
 
-    def magick
-      Shell.which('magick') || raise(Error, 'ImageMagick not found. Install it with: brew install imagemagick')
-    end
-
-    # Mean HSL saturation across opaque pixels. The stock maroon icon scores
-    # ~0.6; both patched styles stay well under 0.1.
     def grey?(png)
-      out = Shell.run!(magick, png, '-alpha', 'off', '-colorspace', 'HSL', '-channel', 'G', '-separate',
-                       '+channel', '-format', '%[fx:mean]', 'info:')
-      out.to_f < 0.15
+      saturation = Shell.run!(
+        magick, png,
+        '-alpha', 'off',
+        '-colorspace', 'HSL',
+        '-channel', 'G', '-separate', '+channel',
+        '-format', '%[fx:mean]', 'info:'
+      )
+      saturation.to_f < GREY_SATURATION_LIMIT
     end
 
-    # body only: black-on-transparent template; the white bar and border are
-    # cut out, otherwise the shield becomes a solid blob once Safari tints it.
-    # body + detail: recolour the shield body and the white bar/border
-    # separately, touching RGB only so the alpha edge survives.
-    def recolor!(png, body:, detail: nil)
-      if detail
-        Shell.run!(magick, png, '-channel', 'RGB', '-fuzz', '25%', '-fill', detail, '-opaque', 'white',
-                   '-fill', body, '+opaque', detail, '+channel', png)
+    def paint(png, paint)
+      if paint.detail
+        recolour_body_and_detail(png, paint)
       else
-        Shell.run!(magick, png, '-fuzz', '30%', '-transparent', 'white', '-fill', body, '-colorize', '100%', png)
+        cut_out_template(png, paint)
       end
     end
+
+    private
+
+      def magick
+        @magick ||= Shell.which('magick') || raise(Error, MISSING_MAGICK_ERROR)
+      end
+
+      # Recolour the shield body and the white bar/border separately, touching
+      # RGB only so the anti-aliased alpha edge survives.
+      def recolour_body_and_detail(png, paint)
+        Shell.run!(
+          magick, png,
+          '-channel', 'RGB',
+          '-fuzz', '25%', '-fill', paint.detail, '-opaque', 'white',
+          '-fill', paint.body, '+opaque', paint.detail,
+          '+channel',
+          png
+        )
+      end
+
+      # Black on transparent. The white bar and border are cut out, otherwise
+      # the shield becomes a solid blob once Safari tints it.
+      def cut_out_template(png, paint)
+        Shell.run!(
+          magick, png,
+          '-fuzz', '30%', '-transparent', 'white',
+          '-fill', paint.body, '-colorize', '100%',
+          png
+        )
+      end
   end
 
-  module Signing
-    module_function
+  # Re-signs bundles with an identity from the user's keychain, or ad-hoc.
+  class CodeSigner
+    AD_HOC_IDENTITY = '-'
+    # Entitlements that only validate with the original team's provisioning,
+    # which a re-signed build cannot carry.
+    TEAM_BOUND_ENTITLEMENTS = %w[
+      com.apple.application-identifier
+      com.apple.developer.team-identifier
+      keychain-access-groups
+      com.apple.security.application-groups
+    ].freeze
 
-    def default_identity
-      out = Shell.run!('security', 'find-identity', '-v', '-p', 'codesigning')
-      out[/"(Apple Development: [^"]+)"/, 1]
+    class << self
+      def verifies?(bundle)
+        Shell.succeeds?('codesign', '--verify', '--deep', '--strict', bundle)
+      end
+
+      def default_identity
+        identities = Shell.run!('security', 'find-identity', '-v', '-p', 'codesigning')
+        identities[/"(Apple Development: [^"]+)"/, 1]
+      end
     end
 
-    def sign!(target, identity, entitlements)
+    attr_reader :identity
+
+    def initialize(identity)
+      @identity = identity
+    end
+
+    def ad_hoc?
+      identity == AD_HOC_IDENTITY
+    end
+
+    def description
+      ad_hoc? ? 'ad-hoc identity' : identity
+    end
+
+    def sign!(target, entitlements)
+      portable_entitlements = entitlements.reject { |key, _| TEAM_BOUND_ENTITLEMENTS.include?(key) }
+
       Dir.mktmpdir('ublock-iconizer') do |dir|
         plist = File.join(dir, 'entitlements.plist')
-        xml = Shell.run!('plutil', '-convert', 'xml1', '-o', '-', '-', stdin: JSON.generate(entitlements))
-        File.write(plist, xml)
-        Shell.run!('codesign', '--force', '--options', 'runtime', '--timestamp=none',
-                   '--entitlements', plist, '--sign', identity, target)
+        File.write(plist, entitlements_xml(portable_entitlements))
+        Shell.run!(
+          'codesign', '--force',
+          '--options', 'runtime',
+          '--timestamp=none',
+          '--entitlements', plist,
+          '--sign', identity,
+          target
+        )
       end
     end
 
-    def strip_team_bound(entitlements)
-      entitlements.reject { |key, _| TEAM_BOUND_ENTITLEMENTS.include?(key) }
+    private
+
+      def entitlements_xml(entitlements)
+        Shell.run!('plutil', '-convert', 'xml1', '-o', '-', '-', stdin: JSON.generate(entitlements))
+      end
+  end
+
+  # Remembers the last patch and restore in state.json.
+  class State
+    def initialize(dir)
+      @file = File.join(dir, 'state.json')
+    end
+
+    def read
+      return {} unless File.exist?(@file)
+
+      JSON.parse(File.read(@file))
+    end
+
+    def write(values)
+      FileUtils.mkdir_p(File.dirname(@file))
+      File.write(@file, JSON.pretty_generate(values) + "\n")
     end
   end
 
-  class Backups
-    def initialize(root = SUPPORT_DIR)
+  # Keeps one pristine copy of the app per version.
+  class BackupStore
+    def initialize(root)
       @root = root
     end
 
-    def state_file = File.join(@root, 'state.json')
-
-    def state
-      File.exist?(state_file) ? JSON.parse(File.read(state_file)) : {}
+    def dir_for(version)
+      File.join(@root, 'backup', version)
     end
 
-    def write_state(hash)
-      FileUtils.mkdir_p(@root)
-      File.write(state_file, JSON.pretty_generate(hash) + "\n")
+    def path_for(version, app_name)
+      File.join(dir_for(version), app_name)
     end
-
-    def dir_for(version) = File.join(@root, 'backup', version)
-
-    def path_for(version, app_name) = File.join(dir_for(version), app_name)
 
     def save!(app)
-      dest = path_for(app.version, app.name)
-      if File.directory?(dest)
-        # Never clobber a backup that still verifies; it may be the only pristine copy left.
-        return dest if verifies?(dest)
+      destination = path_for(app.version, app.name)
+      if File.directory?(destination)
+        # A backup that still verifies may be the only pristine copy left.
+        return destination if CodeSigner.verifies?(destination)
 
-        FileUtils.rm_rf(dest)
+        FileUtils.rm_rf(destination)
       end
-      FileUtils.mkdir_p(File.dirname(dest))
+
+      FileUtils.mkdir_p(File.dirname(destination))
       # ditto preserves resource forks, xattrs (App Store metadata) and signatures.
-      Shell.run!('ditto', app.path, dest)
-      dest
+      Shell.run!('ditto', app.path, destination)
+      destination
     end
 
     def restore!(version, app)
-      src = path_for(version, app.name)
-      raise Error, "No backup for version #{version} at #{src}" unless File.directory?(src)
+      source = path_for(version, app.name)
+      raise Error, "No backup for version #{version} at #{source}" unless File.directory?(source)
 
-      raise Error, "Backup at #{src} does not verify; reinstall from the App Store instead" unless verifies?(src)
+      unless CodeSigner.verifies?(source)
+        raise Error, "Backup at #{source} does not verify; reinstall from the App Store instead"
+      end
 
       guard_removal!(app.path)
       # Copy next to the live app first, then swap, so a failed copy leaves the app in place.
       staging = "#{app.path}.ublock-iconizer-restore"
       FileUtils.rm_rf(staging)
-      Shell.run!('ditto', src, staging)
+      Shell.run!('ditto', source, staging)
       FileUtils.rm_rf(app.path)
       File.rename(staging, app.path)
     end
 
-    def verifies?(bundle)
-      _, _, status = Shell.run('codesign', '--verify', '--deep', '--strict', bundle)
-      status.success?
-    end
-
     private
 
-    def guard_removal!(path)
-      ok = path.end_with?('.app') && File.directory?(File.join(path, 'Contents/PlugIns'))
-      raise Error, "Refusing to remove #{path}: not an app bundle with plug-ins" unless ok
+      def guard_removal!(path)
+        looks_like_app = path.end_with?('.app') && File.directory?(File.join(path, 'Contents/PlugIns'))
+        raise Error, "Refusing to remove #{path}: not an app bundle with plug-ins" unless looks_like_app
+      end
+  end
+
+  module Commands
+    # Shared collaborators and checks for the three commands.
+    class Base
+      def initialize(app:, backups:, state:, options:)
+        @app = app
+        @backups = backups
+        @state = state
+        @options = options
+      end
+
+      private
+
+        attr_reader :app, :backups, :state, :options
+
+        def ensure_app_exists!
+          return if app.exist?
+
+          raise Error, "App not found at #{app.path}. Install uBlock Origin Lite from the App Store first."
+        end
+
+        # App Store installs are owned by root. Signing must run as the user
+        # (the identity lives in the user's keychain), so take ownership once.
+        def take_ownership!
+          return if app.writable?
+
+          user = Shell.run!('id', '-un').strip
+          puts "#{app.path} is not writable by #{user}; taking ownership (sudo will ask for your password)..."
+          return if system('sudo', 'chown', '-R', "#{user}:staff", app.path)
+
+          raise Error, "could not take ownership. Run manually: sudo chown -R #{user}:staff #{app.path.inspect}"
+        end
+    end
+
+    class Status < Base
+      def run
+        ensure_app_exists!
+        version = app.version
+        last = state.read
+
+        puts "App:        #{app.path}"
+        puts "Version:    #{version}"
+        puts "Signed by:  #{signer_line}"
+        puts "Icons:      #{icons_line(last)}"
+        puts "Backup:     #{backup_line(version)}"
+        puts "Last patch: #{last['patched_at'] || 'never'} (version #{last['version'] || '-'})" if last.any?
+
+        return unless updated_since_last_patch?(version, last)
+
+        puts
+        puts 'The App Store has updated the app since the last patch. Run `ublock-iconizer patch` again.'
+      end
+
+      private
+
+        def signer_line
+          authority = app.signing_authority || 'unsigned'
+          app.signature_valid? ? authority : "#{authority} (signature INVALID)"
+        end
+
+        def icons_line(last)
+          painter = IconPainter.new
+          return 'coloured (stock)' unless app.on_icons.all? { |png| painter.grey?(png) }
+
+          last['style'] ? "grey (patched, style #{last['style']})" : 'grey (patched)'
+        end
+
+        def backup_line(version)
+          backup = backups.path_for(version, app.name)
+          File.directory?(backup) ? backup : 'none for this version'
+        end
+
+        def updated_since_last_patch?(version, last)
+          return false unless app.pristine?
+          return false if last['version'].nil?
+
+          last['version'] != version
+        end
+    end
+
+    class Patch < Base
+      def run
+        ensure_app_exists!
+        take_ownership!
+        version = app.version
+        signer = CodeSigner.new(resolve_identity)
+
+        case readiness
+        when :pristine
+          puts "Backing up pristine #{version} build..."
+          puts "  -> #{backups.save!(app)}"
+        when :already_patched
+          puts "Already patched (version #{version}). Nothing to do."
+          return
+        when :invalid_signature
+          raise Error, 'App is modified but not validly signed (a previous patch probably failed mid-way). ' \
+                       'Run `ublock-iconizer restore`, or reinstall from the App Store, then patch again.'
+        when :foreign_signer
+          raise Error, 'App is signed by someone else and not patched by this tool. Reinstall it from the App Store first.'
+        end
+
+        recolour_icons(style)
+        re_sign(signer)
+        app.register
+        remember_patch(version, signer)
+        print_next_steps
+      end
+
+      private
+
+        def style
+          STYLES.fetch(options[:style])
+        end
+
+        def resolve_identity
+          identity = options[:identity] || CodeSigner.default_identity
+          return identity if identity
+
+          warn 'warning: no "Apple Development" identity found; signing ad-hoc. Safari will only load the'
+          warn '         extension with Develop > Allow Unsigned Extensions, which resets on every launch.'
+          CodeSigner::AD_HOC_IDENTITY
+        end
+
+        def readiness
+          return :pristine if app.pristine?
+          return :invalid_signature unless app.signature_valid?
+          return :already_patched if icons_grey?
+
+          :foreign_signer
+        end
+
+        def icons_grey?
+          painter = IconPainter.new
+          app.on_icons.all? { |png| painter.grey?(png) }
+        end
+
+        def recolour_icons(style)
+          puts "Recolouring toolbar icons (style: #{style.name})..."
+          painter = IconPainter.new
+          paint_all(painter, app.on_icons, style.on)
+          paint_all(painter, app.off_icons, style.off)
+        end
+
+        def paint_all(painter, pngs, paint)
+          return if paint.nil?
+
+          pngs.each do |png|
+            raise Error, "Missing icon #{png}" unless File.file?(png)
+
+            painter.paint(png, paint)
+          end
+        end
+
+        def re_sign(signer)
+          puts "Re-signing with #{signer.description}..."
+          signer.sign!(app.extension_path, app.entitlements(app.extension_path))
+          signer.sign!(app.path, app.entitlements(app.path))
+          app.verify_signature!
+          puts 'Signature verified.'
+        end
+
+        def remember_patch(version, signer)
+          state.write(
+            'version' => version,
+            'patched_at' => Time.now.iso8601,
+            'identity' => signer.identity,
+            'style' => style.name,
+            'app' => app.path
+          )
+        end
+
+        def print_next_steps
+          puts
+          puts 'Done. Quit and reopen Safari, then enable the extension in Safari > Settings > Extensions.'
+          puts 'Per-site permissions will need to be granted again (the signing team changed).'
+        end
+    end
+
+    class Restore < Base
+      def run
+        ensure_app_exists!
+        version = app.version
+        if app.pristine?
+          puts "App is the pristine App Store build (#{version}). Nothing to restore."
+          return
+        end
+
+        take_ownership!
+        puts "Restoring pristine #{version} build from backup..."
+        backups.restore!(version, app)
+        app.verify_signature!
+        app.register
+        delete_backup(version) if options[:delete_backup]
+        state.write(state.read.merge('restored_at' => Time.now.iso8601))
+        puts 'Done. Quit and reopen Safari. The App Store can update the app again.'
+      end
+
+      private
+
+        def delete_backup(version)
+          FileUtils.rm_rf(backups.dir_for(version))
+          puts 'Backup deleted.'
+        end
     end
   end
 
   class CLI
+    COMMANDS = {
+      'status' => Commands::Status,
+      'patch' => Commands::Patch,
+      'restore' => Commands::Restore
+    }.freeze
+    USAGE = 'usage: ublock-iconizer (status|patch|restore) [--app PATH] [--identity NAME] ' \
+            '[--style grey|template] [--delete-backup]'
+
     def initialize(argv)
       @argv = argv.dup
-      @options = { app: DEFAULT_APP, identity: nil, delete_backup: false, style: 'grey' }
+      @options = { app: DEFAULT_APP_PATH, identity: nil, delete_backup: false, style: 'grey' }
     end
 
     def run
-      command = parse!
-      @app = App.new(@options[:app])
-      @backups = Backups.new
-
-      case command
-      when 'status' then status
-      when 'patch' then patch
-      when 'restore' then restore
-      else usage(1)
-      end
+      command_class = COMMANDS.fetch(parse_command_name) { usage(1) }
+      command = command_class.new(
+        app: AppBundle.new(@options[:app]),
+        backups: BackupStore.new(SUPPORT_DIR),
+        state: State.new(SUPPORT_DIR),
+        options: @options
+      )
+      command.run
       0
     rescue Error => e
       warn "error: #{e.message}"
@@ -256,136 +588,35 @@ module UblockIconizer
 
     private
 
-    def parse!
-      parser = OptionParser.new do |o|
-        o.banner = 'usage: ublock-iconizer (status|patch|restore) [options]'
-        o.on('--app PATH', 'App bundle to operate on (default: /Applications/uBlock Origin Lite.app)') { |v| @options[:app] = File.expand_path(v) }
-        o.on('--identity NAME', 'codesign identity (default: first "Apple Development" identity, else ad-hoc)') { |v| @options[:identity] = v }
-        o.on('--delete-backup', 'restore: remove the pristine backup afterwards') { @options[:delete_backup] = true }
-        o.on('--style STYLE', STYLES.keys, "patch: #{STYLES.keys.join('|')} (default: grey). " \
-                                           'template is tinted blue by Safari on tabs the extension can access') { |v| @options[:style] = v }
-        o.on('-h', '--help') { puts o; exit 0 }
-      end
-      parser.parse!(@argv)
-      @argv.shift || usage(1)
-    end
-
-    def usage(code)
-      warn 'usage: ublock-iconizer (status|patch|restore) [--app PATH] [--identity NAME] [--style grey|template] [--delete-backup]'
-      exit code
-    end
-
-    def ensure_app!
-      raise Error, "App not found at #{@app.path}. Install uBlock Origin Lite from the App Store first." unless @app.exist?
-    end
-
-    # App Store installs are owned by root. Signing must run as the user (the
-    # identity lives in the user's keychain), so take ownership of the bundle once.
-    def ensure_writable!
-      return if File.writable?(@app.img_dir) && File.writable?(File.dirname(@app.path))
-
-      user = Shell.run!('id', '-un').strip
-      puts "#{@app.path} is not writable by #{user}; taking ownership (sudo will ask for your password)..."
-      system('sudo', 'chown', '-R', "#{user}:staff", @app.path) ||
-        raise(Error, "could not take ownership. Run manually: sudo chown -R #{user}:staff #{@app.path.inspect}")
-    end
-
-    def status
-      ensure_app!
-      version = @app.version
-      state = @backups.state
-      puts "App:        #{@app.path}"
-      puts "Version:    #{version}"
-      puts "Signed by:  #{@app.signing_authority || 'unsigned'}#{@app.signature_valid? ? '' : ' (signature INVALID)'}"
-      puts "Icons:      #{@app.icons_grey? ? "grey (patched#{state['style'] ? ", style #{state['style']}" : ''})" : 'coloured (stock)'}"
-      backup = @backups.path_for(version, @app.name)
-      puts "Backup:     #{File.directory?(backup) ? backup : 'none for this version'}"
-      puts "Last patch: #{state['patched_at'] || 'never'} (version #{state['version'] || '-'})" if state.any?
-      if @app.pristine? && state['version'] && state['version'] != version
-        puts
-        puts "The App Store has updated the app since the last patch. Run `ublock-iconizer patch` again."
-      end
-    end
-
-    def patch
-      ensure_app!
-      ensure_writable!
-      version = @app.version
-      identity = @options[:identity] || Signing.default_identity
-      if identity.nil?
-        warn 'warning: no "Apple Development" identity found; signing ad-hoc. Safari will only load the'
-        warn '         extension with Develop > Allow Unsigned Extensions, which resets on every launch.'
-        identity = '-'
-      end
-
-      if @app.pristine?
-        puts "Backing up pristine #{version} build..."
-        puts "  -> #{@backups.save!(@app)}"
-      elsif @app.signature_valid? && @app.icons_grey?
-        puts "Already patched (version #{version}). Nothing to do."
-        return
-      elsif !@app.signature_valid?
-        raise Error, 'App is modified but not validly signed (a previous patch probably failed mid-way). ' \
-                     'Run `ublock-iconizer restore`, or reinstall from the App Store, then patch again.'
-      else
-        raise Error, 'App is signed by someone else and not patched by this tool. Reinstall it from the App Store first.'
-      end
-
-      style = STYLES.fetch(@options[:style])
-      puts "Recolouring toolbar icons (style: #{@options[:style]})..."
-      { @app.on_icons => style[:on], @app.off_icons => style[:off] }.each do |pngs, colors|
-        next if colors.nil?
-
-        pngs.each do |png|
-          raise Error, "Missing icon #{png}" unless File.file?(png)
-
-          Icons.recolor!(png, **colors)
+      def parse_command_name
+        parser = OptionParser.new do |o|
+          o.banner = 'usage: ublock-iconizer (status|patch|restore) [options]'
+          o.on('--app PATH', "App bundle to operate on (default: #{DEFAULT_APP_PATH})") do |value|
+            @options[:app] = File.expand_path(value)
+          end
+          o.on('--identity NAME', 'codesign identity (default: first "Apple Development" identity, else ad-hoc)') do |value|
+            @options[:identity] = value
+          end
+          o.on('--delete-backup', 'restore: remove the pristine backup afterwards') do
+            @options[:delete_backup] = true
+          end
+          o.on('--style STYLE', STYLES.keys, "patch: #{STYLES.keys.join('|')} (default: grey). " \
+                                             'template is tinted blue by Safari on tabs the extension can access') do |value|
+            @options[:style] = value
+          end
+          o.on('-h', '--help') do
+            puts o
+            exit 0
+          end
         end
+        parser.parse!(@argv)
+        @argv.shift || usage(1)
       end
 
-      puts "Re-signing with #{identity == '-' ? 'ad-hoc identity' : identity}..."
-      ext_entitlements = Signing.strip_team_bound(@app.entitlements(@app.ext_path))
-      app_entitlements = Signing.strip_team_bound(@app.entitlements(@app.path))
-      Signing.sign!(@app.ext_path, identity, ext_entitlements)
-      Signing.sign!(@app.path, identity, app_entitlements)
-      @app.verify!
-      puts 'Signature verified.'
-
-      register_extension
-      @backups.write_state('version' => version, 'patched_at' => Time.now.iso8601, 'identity' => identity,
-                           'style' => @options[:style], 'app' => @app.path)
-
-      puts
-      puts 'Done. Quit and reopen Safari, then enable the extension in Safari > Settings > Extensions.'
-      puts 'Per-site permissions will need to be granted again (the signing team changed).'
-    end
-
-    def restore
-      ensure_app!
-      version = @app.version
-      if @app.pristine?
-        puts "App is the pristine App Store build (#{version}). Nothing to restore."
-        return
+      def usage(code)
+        warn USAGE
+        exit code
       end
-
-      ensure_writable!
-      puts "Restoring pristine #{version} build from backup..."
-      @backups.restore!(version, @app)
-      @app.verify!
-      register_extension
-      if @options[:delete_backup]
-        FileUtils.rm_rf(@backups.dir_for(version))
-        puts 'Backup deleted.'
-      end
-      @backups.write_state(@backups.state.merge('restored_at' => Time.now.iso8601))
-      puts 'Done. Quit and reopen Safari. The App Store can update the app again.'
-    end
-
-    def register_extension
-      # Tell LaunchServices/pluginkit about the (re-signed) bundle so Safari sees the new one.
-      Shell.run(LSREGISTER, '-f', @app.path)
-      Shell.run('pluginkit', '-a', @app.ext_path)
-    end
   end
 end
 
