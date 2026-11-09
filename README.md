@@ -59,15 +59,45 @@ else in the bundle stays byte for byte as the App Store shipped it.
                 +-- icon_128_off.png /
 ```
 
-## Requirements
+## Install
 
-- macOS with uBlock Origin Lite installed from the App Store at
-  `/Applications/uBlock Origin Lite.app`
-- Ruby 3.0+ (macOS system Ruby is 2.6 and will not work; use a version manager or Homebrew Ruby)
-- ImageMagick (`brew install imagemagick`)
-- An "Apple Development" signing identity in your keychain (free Apple ID via
-  Xcode). Without one the tool signs ad-hoc, and Safari then needs
-  Develop > Allow Unsigned Extensions on every launch.
+Everything the script calls is listed below. Only two things are not part of
+macOS: ImageMagick and a code-signing certificate.
+
+| Dependency | Used for | Comes from |
+| --- | --- | --- |
+| `ruby` 2.6+ | running the script | macOS (`/usr/bin/ruby`), or Homebrew |
+| `magick` (ImageMagick 7) | measuring and recolouring the icon PNGs | Homebrew |
+| `codesign`, `security` | re-signing and finding your identity | macOS |
+| `plutil`, `ditto`, `pluginkit`, `lsregister` | reading the version, copying the bundle, telling Safari | macOS |
+| "Apple Development" certificate | a signature Safari trusts without the Develop menu | Xcode, free Apple ID |
+
+```sh
+# 1. uBlock Origin Lite from the App Store, at its default location
+ls "/Applications/uBlock Origin Lite.app"
+
+# 2. ImageMagick 7 (provides the `magick` binary; ImageMagick 6 will not do)
+brew install imagemagick
+magick -version
+
+# 3. Optional: a newer Ruby. The macOS system Ruby 2.6 is enough.
+brew install ruby
+
+# 4. A signing identity. Install Xcode, then:
+#    Xcode > Settings > Accounts > + > sign in with your Apple ID
+#    > Manage Certificates > + > Apple Development
+security find-identity -v -p codesigning | grep "Apple Development"
+
+# 5. Fetch the script and make it executable
+git clone https://github.com/marianposaceanu/ublock-iconizer.git
+cd ublock-iconizer
+chmod +x ublock-iconizer
+./ublock-iconizer status
+```
+
+Without an Apple Development identity the tool still works but signs ad-hoc,
+and Safari then needs Develop > Allow Unsigned Extensions on every launch.
+Pass `--identity -` to choose ad-hoc signing on purpose.
 
 ## Usage
 
@@ -199,6 +229,8 @@ Tested on the real install (uBlock Origin Lite 2026.1103.1743, macOS 26):
   were all tinted blue by Safari.
 - `restore` puts back a byte-identical App Store build, and a simulated
   mid-failure leaves the backup intact.
+- The macOS system Ruby 2.6 runs `status`. `patch` and `restore` were run
+  under Ruby 4.0 only, but the script uses nothing newer than Ruby 2.5.
 
 ## Notes
 
@@ -212,11 +244,41 @@ Tested on the real install (uBlock Origin Lite 2026.1103.1743, macOS 26):
   measured.
 - Safari sees the re-signed build as a new extension, so it starts disabled
   and per-site permissions are reset.
+- `patch` and `restore` register the bundle with Safari even when `--app`
+  points at a copy, so a copy you test on shows up as a second "uBlock Origin
+  Lite" in Safari > Settings > Extensions. To clean up, run `pluginkit -r` on
+  the copy's `.appex`, `lsregister -u` on the copy, delete the copy, and
+  relaunch Safari.
 
 Not verified: the `_off` icon in Safari (only the active state was seen),
 dark mode (the fixed `#828282` body is a compromise), and the full
 restore, App Store update, patch round trip, which needs a new uBOL release
 to exist.
+
+## Code layout
+
+The script is one file. Each class owns one thing, and the three commands only
+orchestrate.
+
+```
+  CLI  --parses argv, picks a command-->  Commands::Status | Patch | Restore
+                                                     |
+             +-----------------+----------------+----+-----------+
+             v                 v                v                v
+        AppBundle         IconPainter      CodeSigner      BackupStore / State
+   paths, version,     grey? / paint     sign!, verifies?,  save!, restore!,
+   signing authority,  via `magick`      default_identity   state.json
+   pristine?, register
+             \                 |                |                /
+              +--------------- Shell (Open3) ------------------+
+                      run, run!, succeeds?, which
+```
+
+`STYLES` maps a style name to a `Style`, which holds a `Paint` (body and
+detail colours) for the active icons and another for the "no filtering" ones.
+`Commands::Patch#readiness` decides in one place whether the app is pristine,
+already patched, half-patched, or signed by someone else, and `run` acts on
+that answer.
 
 ## Credits
 
