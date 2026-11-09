@@ -257,8 +257,30 @@ to exist.
 
 ## Code layout
 
-The script is one file. Each class owns one thing, and the three commands only
-orchestrate.
+`ublock-iconizer` is a thin runner. It requires `lib/ublock_iconizer.rb` and
+hands `ARGV` to the CLI; everything else lives under `lib/`, one class per
+file. Running it through a symlink works, since `require_relative` resolves
+the real path.
+
+```
+ublock-iconizer                    runner: require lib, run CLI, exit
+lib/
++-- ublock_iconizer.rb             requires, DEFAULT_APP_PATH, SUPPORT_DIR, Error
++-- ublock_iconizer/
+    +-- cli.rb                     argv -> options + command class
+    +-- commands/
+    |   +-- base.rb                shared collaborators, app exists?, take ownership
+    |   +-- status.rb              version, signer, icon state, backup presence
+    |   +-- patch.rb               readiness -> back up, recolour, re-sign, register
+    |   +-- restore.rb             swap the verified backup back in
+    +-- app_bundle.rb              paths, version, signing authority, pristine?, register
+    +-- icon_painter.rb            grey? / paint via `magick`
+    +-- code_signer.rb             sign!, verifies?, default_identity
+    +-- backup_store.rb            save!, restore!, one copy per version
+    +-- state.rb                   state.json
+    +-- style.rb                   Paint, Style, STYLES
+    +-- shell.rb                   run, run!, succeeds?, which (Open3)
+```
 
 ```
   CLI  --parses argv, picks a command-->  Commands::Status | Patch | Restore
@@ -266,12 +288,8 @@ orchestrate.
              +-----------------+----------------+----+-----------+
              v                 v                v                v
         AppBundle         IconPainter      CodeSigner      BackupStore / State
-   paths, version,     grey? / paint     sign!, verifies?,  save!, restore!,
-   signing authority,  via `magick`      default_identity   state.json
-   pristine?, register
              \                 |                |                /
               +--------------- Shell (Open3) ------------------+
-                      run, run!, succeeds?, which
 ```
 
 `STYLES` maps a style name to a `Style`, which holds a `Paint` (body and
