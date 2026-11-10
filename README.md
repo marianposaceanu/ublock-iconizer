@@ -8,6 +8,9 @@ uBlock Origin Lite ships a maroon toolbar icon, so Safari shows it in colour
 This tool recolours the toolbar PNGs inside the extension to a neutral grey and
 re-signs the app so macOS will still load it.
 
+The background, the Safari tinting measurements and the design of the tool are
+written up in [A grey uBlock Origin Lite icon in Safari, with a way back](https://ark.marianposaceanu.com/ublock-origin-lite-safari-grey-icon).
+
 ```
    stock                      patched (grey)
 +-----------+                +-----------+
@@ -22,7 +25,7 @@ re-signs the app so macOS will still load it.
 
 ## How it works
 
-Safari's rules, as measured on macOS 26: a greyscale or single-colour icon is
+Safari's rules, as measured on macOS 27.2: a greyscale or single-colour icon is
 treated as a template and tinted with the accent colour (blue) on every tab
 the extension has access to, which with uBlock is every tab. A multi-colour
 icon is shown as-is. The default `grey` style therefore keeps a neutral grey
@@ -217,7 +220,7 @@ swaps it in, byte for byte, including the App Store receipt and metadata.
 
 ## What has been verified
 
-Tested on the real install (uBlock Origin Lite 2026.1103.1743, macOS 26):
+Tested on the real install (uBlock Origin Lite 2026.1103.1743, macOS 27.2):
 
 - The re-signed app launches under hardened runtime with an Apple Development
   certificate.
